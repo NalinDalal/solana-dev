@@ -1649,3 +1649,15 @@ The transaction to create a token account needs two instructions:
 
 `ata.ts`,`ata.rs`
 
+# Mint Tokens
+Minting tokens refers to the process of creating new units of a token by
+invoking the MintTo instruction on a token program.
+
+`mint-token.ts`,`mint-token.rs`
+
+# Transfer Tokens
+## How to Transfer Tokens
+
+- Transferring tokens involves moving tokens from one token account to another token account that share the same mint.
+- happens when you invoke the TransferChecked instruction on a token program.
+`token-trans.ts`,`token-trans.rs`
