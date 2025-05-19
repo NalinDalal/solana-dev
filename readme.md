@@ -1637,27 +1637,499 @@ pub fn get_associated_token_address_and_bump_seed_internal(
 ```
 
 ## How to Create a Token Account
-invoke the `InitializeAccount` instruction. 
+
+invoke the `InitializeAccount` instruction.
 The transaction to create a token account needs two instructions:
+
 1. Invoke the System Program to create and allocate space for a token account and transfer ownership to the Token Program.
 2. Invoke the Token Program to initialize the token account data.
 
 `token-acc.rs`,`token-acc.ts`
 
 ## How to Create an Associated Token Account
- invoke the Create instruction.
+
+invoke the Create instruction.
 
 `ata.ts`,`ata.rs`
 
 # Mint Tokens
+
 Minting tokens refers to the process of creating new units of a token by
 invoking the MintTo instruction on a token program.
 
 `mint-token.ts`,`mint-token.rs`
 
 # Transfer Tokens
-## How to Transfer Tokens
 
 - Transferring tokens involves moving tokens from one token account to another token account that share the same mint.
 - happens when you invoke the TransferChecked instruction on a token program.
-`token-trans.ts`,`token-trans.rs`
+  `token-trans.ts`,`token-trans.rs`
+
+# Extensions
+
+Toekn Extensions provides more features through extra instructions referred to
+as extensions. They are optional features you can add to a token mint or token account.
+
+The Token Extensions Program defines an `ExtensionType` enum that lists all available extensions you can add to a token mint or token account.
+
+ExtensionType enum is defined as:
+
+```rs
+/// Extensions that can be applied to mints or accounts.  Mint extensions must
+/// only be applied to mint accounts, and account extensions must only be
+/// applied to token holding accounts.
+#[repr(u16)]
+#[cfg_attr(feature = "serde-traits", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde-traits", serde(rename_all = "camelCase"))]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive, IntoPrimitive)]
+pub enum ExtensionType {
+    /// Used as padding if the account size would otherwise be 355, same as a
+    /// multisig
+    Uninitialized,
+    /// Includes transfer fee rate info and accompanying authorities to withdraw
+    /// and set the fee
+    TransferFeeConfig,
+    /// Includes withheld transfer fees
+    TransferFeeAmount,
+    /// Includes an optional mint close authority
+    MintCloseAuthority,
+    /// Auditor configuration for confidential transfers
+    ConfidentialTransferMint,
+    /// State for confidential transfers
+    ConfidentialTransferAccount,
+    /// Specifies the default Account::state for new Accounts
+    DefaultAccountState,
+    /// Indicates that the Account owner authority cannot be changed
+    ImmutableOwner,
+    /// Require inbound transfers to have memo
+    MemoTransfer,
+    /// Indicates that the tokens from this mint can't be transferred
+    NonTransferable,
+    /// Tokens accrue interest over time,
+    InterestBearingConfig,
+    /// Locks privileged token operations from happening via CPI
+    CpiGuard,
+    /// Includes an optional permanent delegate
+    PermanentDelegate,
+    /// Indicates that the tokens in this account belong to a non-transferable
+    /// mint
+    NonTransferableAccount,
+    /// Mint requires a CPI to a program implementing the "transfer hook"
+    /// interface
+    TransferHook,
+    /// Indicates that the tokens in this account belong to a mint with a
+    /// transfer hook
+    TransferHookAccount,
+    /// Includes encrypted withheld fees and the encryption public that they are
+    /// encrypted under
+    ConfidentialTransferFeeConfig,
+    /// Includes confidential withheld transfer fees
+    ConfidentialTransferFeeAmount,
+    /// Mint contains a pointer to another account (or the same account) that
+    /// holds metadata
+    MetadataPointer,
+    /// Mint contains token-metadata
+    TokenMetadata,
+    /// Mint contains a pointer to another account (or the same account) that
+    /// holds group configurations
+    GroupPointer,
+    /// Mint contains token group configurations
+    TokenGroup,
+    /// Mint contains a pointer to another account (or the same account) that
+    /// holds group member configurations
+    GroupMemberPointer,
+    /// Mint contains token group member configurations
+    TokenGroupMember,
+    /// Mint allowing the minting and burning of confidential tokens
+    ConfidentialMintBurn,
+    /// Tokens whose UI amount is scaled by a given amount
+    ScaledUiAmount,
+    /// Tokens where minting / burning / transferring can be paused
+    Pausable,
+    /// Indicates that the account belongs to a pausable mint
+    PausableAccount,
+
+    /// Test variable-length mint extension
+    #[cfg(test)]
+    VariableLenMintTest = u16::MAX - 2,
+    /// Padding extension used to make an account exactly Multisig::LEN, used
+    /// for testing
+    #[cfg(test)]
+    AccountPaddingTest,
+    /// Padding extension used to make a mint exactly Multisig::LEN, used for
+    /// testing
+    #[cfg(test)]
+    MintPaddingTest,
+}
+```
+
+adds specialized functionality by including extra state to a mint or token
+account. must further deserialize the tlv_data (containing extension state) according to the specific extension types enabled for that account.
+
+```rs
+/// Encapsulates immutable base state data (mint or account) with possible
+/// extensions, where the base state is Pod for zero-copy serde.
+#[derive(Debug, PartialEq)]
+pub struct PodStateWithExtensions<'data, S: BaseState + Pod> {
+    /// Unpacked base data
+    pub base: &'data S,
+    /// Slice of data containing all TLV data, deserialized on demand
+    tlv_data: &'data [u8],
+}
+```
+
+---
+
+# Confidential Transfer
+
+They enable to transfer token b/w accounts w/o revealing the token amount. token account addresses remain public.
+
+## Working
+
+extension adds instructions to the Token Extension program that allows you to transfer tokens between accounts without revealing the transfer amount.
+
+    sequenceDiagram
+
+    participant A as Sender Wallet
+    participant AA as Sender Token Account
+    participant BB as Recipient Token Account
+    participant B as Recipient Wallet
+
+    A->>AA: Deposit
+    A->>AA: Apply
+
+    AA->>BB: Transfer
+    B->>BB: Apply
+
+    B->>BB: Withdraw
+
+basic flow:
+
+1. Create a mint account with the confidential transfer extension.
+2. Create token accounts with confidential transfer extension for the sender and recipient.
+3. Mint tokens to the sender account.
+4. Deposit sender's public balance to confidential pending balance.
+5. Apply sender's pending balance to confidential available balance.
+6. Confidentially transfer tokens from sender token account to recipient token account.
+7. Apply recipient's pending balance to confidential available balance.
+8. Withdraw recipient's confidential available balance to public balance.
+
+basic flow:
+
+sequenceDiagram
+participant Sender as Sender Wallet
+participant SenderAccount as Sender Token Account
+participant Mint as Token Mint
+participant Token22 as Token Extensions Program
+participant ATAProgram as Associated Token Program
+participant ElGamal as ZK ElGamal Proof Program
+participant RecipientAccount as Recipient Token Account
+participant Recipient as Recipient Wallet
+
+    rect rgba(120, 160, 235, 0.3)
+    Note over Sender,Mint: 1. Initialize Mint
+
+    activate Sender
+    Sender->>Token22: create_mint (with Confidential Transfer Extension)
+    activate Token22
+    Token22-->>Mint: Initialize mint
+    deactivate Token22
+    deactivate Sender
+    end
+
+    rect rgba(130, 210, 170, 0.3)
+    Note over Sender,SenderAccount: 2. Set Up Sender Account
+
+    activate Sender
+    Note right of Sender: Generate encryption keys
+    Sender->>Sender: Generate ElGamal keypair
+    Sender->>Sender: Generate AES key
+
+    Sender->>ATAProgram: create_associated_token_account
+    activate ATAProgram
+    ATAProgram->>Token22: Create token account at deterministic address
+    activate Token22
+    Token22-->>SenderAccount: Initialize account
+    deactivate Token22
+    deactivate ATAProgram
+
+    Sender->>Token22: reallocate & configure_account
+    activate Token22
+    Token22-->>SenderAccount: Configure for confidential transfers
+    deactivate Token22
+    deactivate Sender
+    end
+
+    rect rgba(130, 210, 170, 0.3)
+    Note over Recipient,RecipientAccount: 3. Set Up Recipient Account
+
+    activate Recipient
+    Note right of Recipient: Generate encryption keys
+    Recipient->>Recipient: Generate ElGamal keypair
+    Recipient->>Recipient: Generate AES key
+
+    Recipient->>ATAProgram: create_associated_token_account
+    activate ATAProgram
+    ATAProgram->>Token22: Create token account at deterministic address
+    activate Token22
+    Token22-->>RecipientAccount: Initialize account
+    deactivate Token22
+    deactivate ATAProgram
+
+    Recipient->>Token22: reallocate & configure_account
+    activate Token22
+    Token22-->>RecipientAccount: Configure for confidential transfers
+    deactivate Token22
+    deactivate Recipient
+    end
+
+    rect rgba(235, 160, 80, 0.3)
+    Note over Sender,SenderAccount: 4. Mint & Convert to Confidential Balance
+
+    activate Sender
+    Sender->>Token22: mint_tokens
+    activate Token22
+    Token22-->>SenderAccount: Increase token account public balance
+    deactivate Token22
+
+    Sender->>Token22: deposit_tokens
+    activate Token22
+    Token22-->>SenderAccount: Convert to confidential pending balance
+    deactivate Token22
+
+    Sender->>Sender: Use ElGamal keypair & AES key to decrypt
+    Sender->>Token22: apply_pending_balance
+    activate Token22
+    Token22-->>SenderAccount: Convert pending balance to available balance
+    deactivate Token22
+    deactivate Sender
+    end
+
+    rect rgba(235, 120, 120, 0.3)
+    Note over Sender,RecipientAccount: 5. Confidential Transfer
+
+    activate Sender
+    Note right of Sender: Create proofs
+    Sender->>Sender: Generate proof data for transfer
+
+    Sender->>ElGamal: Create equality proof context account
+    activate ElGamal
+    Sender->>ElGamal: Create ciphertext validity proof context account
+    Sender->>ElGamal: Create range proof context account
+    ElGamal-->>ElGamal: Verify proofs
+
+    Sender->>Token22: transfer_tokens, providing proof context accounts
+    activate Token22
+    Token22-->>SenderAccount: Decrease encrypted available balance
+    Token22-->>RecipientAccount: Increase encrypted pending balance
+    deactivate Token22
+
+    Sender->>ElGamal: Close proof context accounts
+    deactivate ElGamal
+    deactivate Sender
+    end
+
+    rect rgba(180, 150, 235, 0.3)
+    Note over Recipient,RecipientAccount: 6. Apply & Withdraw
+
+    activate Recipient
+    Recipient->>Recipient: Use ElGamal keypair & AES key to decrypt
+    Recipient->>Token22: apply_pending_balance
+    activate Token22
+    Token22-->>RecipientAccount: Convert pending balance to available balance
+    deactivate Token22
+
+    Note right of Recipient: Optional withdrawal
+    Recipient->>Recipient: Generate proof data for withdraw
+
+    Recipient->>ElGamal: Create equality proof context account
+    activate ElGamal
+    Recipient->>ElGamal: Create range proof context account
+    ElGamal-->>ElGamal: Verify proofs
+
+    Recipient->>Token22: withdraw_tokens, providing proof context accounts
+    activate Token22
+    Token22-->>RecipientAccount: Convert from available confidential balance to public balance
+    deactivate Token22
+
+    Recipient->>ElGamal: Close proof context accounts
+    deactivate ElGamal
+    deactivate Recipient
+    end
+
+ex:
+run the local validator-> `solana-test-validator --clone-upgradeable-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb --url https://api.mainnet-beta.solana.com -r`
+
+`toekn-conf.rs`
+
+## Confidential Transfer Instructions
+
+| Instruction                   | Description                                                                                                                                        |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| InitializeMint                | Sets up mint account for confidential transfers. This instruction must be included in the same transaction as `TokenInstruction::InitializeMint`.  |
+| UpdateMint                    | Updates confidential transfer settings for a mint.                                                                                                 |
+| ConfigureAccount              | Sets up a token account for confidential transfers.                                                                                                |
+| ApproveAccount                | Approves a token account for confidential transfers if the mint requires approval for new token accounts.                                          |
+| EmptyAccount                  | Empties the pending and available confidential balances to allow closing a token account.                                                          |
+| Deposit                       | Converts public token balance into pending confidential balance.                                                                                   |
+| Withdraw                      | Converts available confidential balance back to public balance.                                                                                    |
+| Transfer                      | Transfers tokens between token accounts confidentially.                                                                                            |
+| ApplyPendingBalance           | Converts pending balance into available balance after deposits or transfers.                                                                       |
+| EnableConfidentialCredits     | Allows a token account to receive confidential token transfers.                                                                                    |
+| DisableConfidentialCredits    | Blocks incoming confidential transfers while still allowing public transfers.                                                                      |
+| EnableNonConfidentialCredits  | Allows a token account to receive public token transfers.                                                                                          |
+| DisableNonConfidentialCredits | Blocks regular transfers to make account receive only confidential transfers.                                                                      |
+| TransferWithFee               | Transfers tokens between token accounts confidentially with a fee.                                                                                 |
+| ConfigureAccountWithRegistry  | Alternative way to configure token accounts for confidential transfers using an `ElGamalRegistry` account instead of `VerifyPubkeyValidity` proof. |
+
+### Create a Token Mint
+
+```sequenceDiagram
+    participant Payer as Wallet
+    participant Token22 as Token Extensions Program
+    participant Mint as Mint Account
+
+    Payer->>Token22: create_mint <br>(with Confidential Transfer Extension)
+    activate Token22
+    Token22-->>Mint: Initialize mint with extension data
+    deactivate Token22
+```
+
+adds the `ConfidentialTransferMint` state to the mint account:
+
+```rs
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct ConfidentialTransferMint {
+    /// Authority to modify the `ConfidentialTransferMint` configuration and to
+    /// approve new accounts (if `auto_approve_new_accounts` is true)
+    ///
+    /// The legacy Token Multisig account is not supported as the authority
+    pub authority: OptionalNonZeroPubkey,
+
+    /// Indicate if newly configured accounts must be approved by the
+    /// `authority` before they may be used by the user.
+    ///
+    /// * If `true`, no approval is required and new accounts may be used
+    ///   immediately
+    /// * If `false`, the authority must approve newly configured accounts (see
+    ///   `ConfidentialTransferInstruction::ConfigureAccount`)
+    pub auto_approve_new_accounts: PodBool,
+
+    /// Authority to decode any transfer amount in a confidential transfer.
+    pub auditor_elgamal_pubkey: OptionalNonZeroElGamalPubkey,
+}
+```
+
+contains 3 config fields:
+
+- authority: The account that has permission to change confidential transfer settings for the mint and approve new confidential accounts if auto-approval is disabled.
+
+- auto_approve_new_accounts: When set to true, users can create token accounts with confidential transfers enabled by default. When false, the authority must approve each new token account before it can be used for confidential transfers.
+
+- auditor_elgamal_pubkey: An optional auditor that can decrypt transfer amounts in confidential transactions, providing a compliance mechanism while maintaining privacy from the general public.
+
+### Required Instruction
+
+Create the Mint Account: Invoke the System Program's CreateAccount instruction to create the mint account.
+
+Initialize Confidential Transfer Extension: Invoke the Token Extension Program's ConfidentialTransferInstruction::InitializeMint instruction to configure the ConfidentialTransferMint state for the mint.
+
+Initialize Mint: Invoke the Token Extension Program's Instruction::InitializeMint instruction to initialize the standard mint state.
+
+```rs
+use anyhow::{Context, Result};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    signature::{Keypair, Signer},
+};
+use spl_token_client::{
+    client::{ProgramRpcClient, ProgramRpcClientSendTransaction},
+    spl_token_2022::id as token_2022_program_id,
+    token::{ExtensionInitializationParams, Token},
+};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Create connection to local test validator
+    let rpc_client = RpcClient::new_with_commitment(
+        String::from("http://localhost:8899"),
+        CommitmentConfig::confirmed(),
+    );
+
+    // Load the default Solana CLI keypair to use as the fee payer
+    // This will be the wallet paying for the transaction fees
+    // Use Arc to prevent multiple clones of the keypair
+    let payer = Arc::new(load_keypair()?);
+    println!("Using payer: {}", payer.pubkey());
+
+    // Generate a new keypair to use as the address of the token mint
+    let mint = Keypair::new();
+    println!("Mint keypair generated: {}", mint.pubkey());
+
+    // Set up program client for Token client
+    let program_client =
+        ProgramRpcClient::new(Arc::new(rpc_client), ProgramRpcClientSendTransaction);
+
+    // Number of decimals for the mint
+    let decimals = 9;
+
+    // Create a token client for the Token-2022 program
+    // This provides high-level methods for token operations
+    let token = Token::new(
+        Arc::new(program_client),
+        &token_2022_program_id(), // Use the Token-2022 program (newer version with extensions)
+        &mint.pubkey(),           // Address of the new token mint
+        Some(decimals),           // Number of decimal places
+        payer.clone(),            // Fee payer for transactions (cloning Arc, not keypair)
+    );
+
+    // Create extension initialization parameters
+    // The ConfidentialTransferMint extension enables confidential (private) transfers of tokens
+    let extension_initialization_params =
+        vec![ExtensionInitializationParams::ConfidentialTransferMint {
+            authority: Some(payer.pubkey()), // Authority that can modify confidential transfer settings
+            auto_approve_new_accounts: true, // Automatically approve new confidential accounts
+            auditor_elgamal_pubkey: None,    // Optional auditor ElGamal public key
+        }];
+
+    // Create and initialize the mint with the ConfidentialTransferMint extension
+    // This sends a transaction to create the new token mint
+    let transaction_signature = token
+        .create_mint(
+            &payer.pubkey(),                 // Mint authority - can mint new tokens
+            Some(&payer.pubkey()),           // Freeze authority - can freeze token accounts
+            extension_initialization_params, // Add the ConfidentialTransferMint extension
+            &[&mint],                        // Mint keypair needed as signer
+        )
+        .await?;
+
+    // Print results for user verification
+    println!("Mint Address: {}", mint.pubkey());
+    println!("Transaction Signature: {}", transaction_signature);
+
+    Ok(())
+}
+
+// Load the keypair from the default Solana CLI keypair path (~/.config/solana/id.json)
+// This enables using the same wallet as the Solana CLI tools
+fn load_keypair() -> Result<Keypair> {
+    // Get the default keypair path
+    let keypair_path = dirs::home_dir()
+        .context("Could not find home directory")?
+        .join(".config/solana/id.json");
+
+    // Read the keypair file directly into bytes using serde_json
+    // The keypair file is a JSON array of bytes
+    let file = std::fs::File::open(&keypair_path)?;
+    let keypair_bytes: Vec<u8> = serde_json::from_reader(file)?;
+
+    // Create keypair from the loaded bytes
+    // This converts the byte array into a keypair
+    let keypair = Keypair::from_bytes(&keypair_bytes)?;
+
+    Ok(keypair)
+}
+```
