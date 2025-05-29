@@ -2133,3 +2133,5 @@ fn load_keypair() -> Result<Keypair> {
     Ok(keypair)
 }
 ```
+
+## Create a Token Account
