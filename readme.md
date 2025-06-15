@@ -2135,3 +2135,390 @@ fn load_keypair() -> Result<Keypair> {
 ```
 
 ## Create a Token Account
+
+Confidential Transfer extension enables private token transfers by adding extra state to the token account.
+
+```rs
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct ConfidentialTransferAccount {
+    /// The account's approval status for confidential transfers.
+    /// All confidential transfer operations will fail until this is set to `true`.
+    /// If the mint account's `auto_approve_new_accounts` is `true`,
+    /// accounts are automatically approved.
+    pub approved: PodBool,
+
+    /// The ElGamal public key used to encrypt balances and transfer amounts.
+    pub elgamal_pubkey: PodElGamalPubkey,
+
+    /// The encrypted lower 16 bits of the pending balance.
+    /// The balance is split into high and low parts for efficient decryption.
+    pub pending_balance_lo: EncryptedBalance,
+
+    /// The encrypted higher 48 bits of the pending balance.
+    /// The balance is split into high and low parts for efficient decryption.
+    pub pending_balance_hi: EncryptedBalance,
+
+    /// The encrypted balance available for transfers.
+    pub available_balance: EncryptedBalance,
+
+    /// The available balance encrypted with an AES key,
+    /// allowing efficient decryption by the account owner.
+    pub decryptable_available_balance: DecryptableBalance,
+
+    /// If `true`, allows incoming confidential transfers.
+    pub allow_confidential_credits: PodBool,
+
+    /// If `true`, allows incoming non-confidential transfers.
+    pub allow_non_confidential_credits: PodBool,
+
+    /// Counts incoming pending balance credits from `Deposit` and `Transfer` instructions.
+    pub pending_balance_credit_counter: PodU64,
+
+    /// The count limit of pending credits before requiring
+    /// an `ApplyPendingBalance` instruction to convert them into available balance.
+    pub maximum_pending_balance_credit_counter: PodU64,
+
+    /// The `pending_balance_credit_counter` value provided by the client
+    /// through the instruction data the last time the `ApplyPendingBalance` instruction was processed.
+    pub expected_pending_balance_credit_counter: PodU64,
+
+    /// The actual `pending_balance_credit_counter` value on the token account
+    /// at the time the last `ApplyPendingBalance` instruction was processed.
+    pub actual_pending_balance_credit_counter: PodU64,
+}
+
+```
+
+token account requires three instructions:
+
+1. **`Create the Token Account`**: Invoke the Associated Token Program's `AssociatedTokenAccountInstruction:Create` instruction to create the token account.
+
+2. **`Reallocate Account Space`**: Invoke the Token Extension Program's `TokenInstruction::Reallocate` instruction to add space for the `ConfidentialTransferAccount` state.
+
+3. **`Configure Confidential Transfers`**: Invoke the Token Extension Program's ConfidentialTransferInstruction::ConfigureAccount instruction to initialize the `ConfidentialTransferAccount` state.
+
+code: token_acc.rs
+
+# Deposit Tokens
+
+takes 2 stages:
+
+1. Confidential Pending Balance: Initially, tokens are "deposited" from public balance to a "pending" confidential balance.
+2. Confidential Available Balance: The pending balance is then "applied" to the available balance, making the tokens available for confidential transfers.
+
+```sequenceDiagram
+    participant Owner as Wallet
+    participant Token22 as Token Extensions Program
+    participant TokenAccount as Token Account
+
+    Note over TokenAccount: Token account with public balance
+
+    Owner->>Token22: confidential_transfer_deposit()
+    activate Token22
+    Token22-->>TokenAccount: Convert public balance to <br> confidential pending balance
+    deactivate Token22
+
+    Note over TokenAccount: Pending balance must then be <br> applied to available balance before use
+```
+
+code: deposit-token.rs
+
+# Apply Pending Balance
+
+Before tokens can be transferred confidentially, the public token balance must
+be converted to a confidential balance.
+
+1. Confidential Pending Balance: Initially, tokens are "deposited" from public balance to a "pending" confidential balance.
+2. Confidential Available Balance: The pending balance is then "applied" to the available balance, making the tokens available for confidential transfers.
+
+```sequenceDiagram
+    participant Owner as Wallet
+    participant Token22 as Token Extensions Program
+    participant TokenAccount as Token Account
+
+    Note over TokenAccount: Tokens in pending confidential balance<br>after deposit or transfer
+
+ Owner->>Owner: Use encryption keys (ElGamal & AES)<br>for decryption and encryption
+
+    Owner->>Token22: confidential_transfer_apply_pending_balance()
+    activate Token22
+    Token22-->>TokenAccount: Reset pending balance
+    Token22-->>TokenAccount: Add to available balance
+    deactivate Token22
+
+    Note over TokenAccount: Tokens now in available confidential balance<br>ready for confidential transfers
+```
+
+pending_bal.rs
+
+# Withdraw Token
+
+- Generate an equality proof and range proof client-side
+- Invoke the Zk ElGamal proof program to verify the proofs and initialize the "context state" accounts
+- Invoke the ConfidentialTransferInstruction::Withdraw instruction providing the two proof accounts.
+- Close the two proof accounts to recover rent.
+
+The spl_token_client crate provides the following methods:
+
+- `confidential_transfer_create_context_state_account` method that creates a proof account.
+- `confidential_transfer_withdraw` method that invokes the Withdraw instruction.
+- `confidential_transfer_close_context_state_account` method that closes a proof account.
+
+withdraw_token.rs
+
+# Transfer Tokens
+
+token account should be configured with `ConfidentialTransferAccount` state.
+steps:
+
+1. 3 client-side proofs:
+   Equality Proof (CiphertextCommitmentEqualityProofData): Verifies that the new available balance ciphertext after the transfer matches its corresponding Pedersen commitment, ensuring the source account's new available balance is correctly computed as new_balance = current_balance - transfer_amount.
+
+   Ciphertext Validity Proof (BatchedGroupedCiphertext3HandlesValidityProofData): Verifies that the transfer amount ciphertexts are properly generated for all three parties (source, destination, and auditor), ensuring the transfer amount is correctly encrypted under each party's public key.
+
+   Range Proof (BatchedRangeProofU128Data): Verifies that the new available balance and transfer amount (split into low/high bits) are all non-negative and within a specified range.
+
+2. For each proof:
+
+   - Invoke the ZK ElGamal proof program to verify the proof data.
+   - Store the proof-specific metadata in a proof "context state" account to use in other instructions.
+
+3. Invoke the ConfidentialTransferInstruction::Transfer instruction, providing the proof context state accounts.
+
+4. Close the proof context state accounts to recover the SOL used to create them.
+
+## Instructions:
+
+To confidentially transfer tokens:
+
+1. Generate equality, ciphertext validity, and range proofs client-side.
+2. Verify proofs via the ZK ElGamal program and create context state accounts.
+3. Call `ConfidentialTransferInstruction::Transfer`, passing the proof accounts.
+4. Close the proof accounts to reclaim rent.
+
+**Helpful methods in `spl_token_client`:**
+
+- `confidential_transfer_create_context_state_account` – creates proof accounts
+- `confidential_transfer_transfer` – performs the transfer
+- `confidential_transfer_close_context_state_account` – closes proof accounts
+
+# UI Scaled amount
+
+1. Purpose: The Scaled UI Amount extension lets issuers apply a dynamic multiplier to a token's UI amount — useful for representing real-world assets like stocks or dividends.
+
+2. Use Case: In events like stock splits (e.g., doubling shares), it avoids inefficient mass minting by updating the UI multiplier instead.
+
+3. How It Works: With Token-2022, use the ScaledUiAmount extension and the amount_to_ui_amount instruction to set or fetch the UI-adjusted amount anytime.
+
+## Issue Guide
+
+1. Enable the Scaled UI Amount extension on a token mint{create-token.ts}
+   set the scaled_ui_amount_extension field to true in the Mint account
+
+   ```sh
+   $ spl-token --program-id TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb create-token --ui-amount-multiplier 1.5
+   ```
+
+2. Update the UI amount multiplier
+
+   ```sh
+   $ spl-token update-ui-amount-multiplier 66EV4CaihdqyQ1fbsr51wBsoqKLgAG5KiYz7r5XNrxUM 1.5 -- 1746471400
+   ```
+
+3. Fetch the Balance{balance.ts}
+
+```sh
+$ spl-token balance 66EV4CaihdqyQ1fbsr51wBsoqKLgAG5KiYz7r5XNrxUM
+```
+
+---
+
+# Developing on Rust
+
+1. create new rust project
+
+```sh
+cargo init hello_world --lib
+cd hello_world
+cargo add solana-program@1.18.26    #add the dependencies
+```
+
+2. update `cargo.toml`
+
+```toml
+[package]
+name = "hello_world"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "1.18.26"
+```
+
+3. update `src/lib.rs`
+
+```rs
+use solana_program::{
+    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, msg, pubkey::Pubkey,
+};
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    _program_id: &Pubkey,
+    _accounts: &[AccountInfo],
+    _instruction_data: &[u8],
+) -> ProgramResult {
+    msg!("Hello, world!");
+    Ok(())
+}
+```
+
+4. build the program, view program id
+
+```sh
+cargo build-sbf #build
+solana address -k ./target/deploy/hello_world-keypair.json  #program id
+4Ujf5fXfLx2PAwRqcECCLtgDxHKPznoJpa43jUBxFfMz
+```
+
+5. testing the code
+
+```sh
+#dependencies
+cargo add solana-program-test@1.18.26 --dev
+cargo add solana-sdk@1.18.26 --dev
+cargo add tokio --dev
+```
+
+code in `src/lib.rs`
+
+```rs
+#[cfg(test)]
+mod test {
+    use solana_program_test::*;
+    use solana_sdk::{
+        instruction::Instruction, pubkey::Pubkey, signature::Signer, transaction::Transaction,
+    };
+
+    #[tokio::test]
+    async fn test_hello_world() {
+        let program_id = Pubkey::new_unique();
+        let mut program_test = ProgramTest::default();
+        program_test.add_program("hello_world", program_id, None);
+        let (mut banks_client, payer, recent_blockhash) = program_test.start().await;
+        // Create instruction
+        let instruction = Instruction {
+            program_id,
+            accounts: vec![],
+            data: vec![],
+        };
+        // Create transaction with instruction
+        let mut transaction = Transaction::new_with_payer(&[instruction], Some(&payer.pubkey()));
+
+        // Sign transaction
+        transaction.sign(&[&payer], recent_blockhash);
+
+        let transaction_result = banks_client.process_transaction(transaction).await;
+        assert!(transaction_result.is_ok());
+    }
+}
+```
+
+testing via: `cargo test-sbf`
+
+6. Deploy
+
+```sh
+#configure the cli
+solana config set -ul
+```
+
+open new terminal:
+
+```sh
+solana-test-validator #to start validator
+```
+
+open new terminal:
+
+```sh
+solana program deploy ./target/deploy/hello_world.so    #deploy the program
+```
+
+7. Update
+   updated by redeploying to the same program ID
+
+8. Close the program
+
+```sh
+solana program close 4Ujf5fXfLx2PAwRqcECCLtgDxHKPznoJpa43jUBxFfMz
+--bypass-warning
+```
+
+## Program Structure
+
+entrypoint.rs: Defines the entrypoint that routes incoming instructions.
+state.rs: Define program-specific state (account data).
+instructions.rs: Defines the instructions that the program can execute.
+processor.rs: Defines the instruction handlers (functions) that implement the business logic for each instruction.
+error.rs: Defines custom errors that the program can return.
+
+---
+
+# Solana Development Kits
+
+## Rust
+
+following crates are used:
+
+- `solana-program` — Imported by programs running on Solana, compiled to SBF. This crate contains many fundamental data types and is re-exported from solana-sdk, which cannot be imported from a Solana program.
+
+- `solana-sdk` — The basic offchain SDK, it re-exports solana-program and adds more APIs on top of that. Most Solana programs that do not run on-chain will import this.
+
+- `solana-client` — For interacting with a Solana node via the JSON RPC API.
+
+- `solana-cli-config` — Loading and saving the Solana CLI configuration file.
+
+- `solana-clap-utils` — Routines for setting up a CLI, using clap, as used by the main Solana CLI. Includes functions for loading all types of signers supported by the CLI.
+
+```sh
+cargo add solana-sdk solana-client  # transaction, interaction
+cargo add solana-program            #building program
+```
+
+## TypeScript
+
+following packages are used:
+
+- `@solana/web3.js`
+- `@solana/wallet-adapter`
+
+```sh
+yarn add @solana/web3.js@1      #installation with yarn
+npm install --save @solana/web3.js@1    #installation with npm
+```
+
+usage:
+
+```JS
+//javascript
+const solanaWeb3 = require("@solana/web3.js");
+console.log(solanaWeb3);
+```
+
+```js
+//ES6
+import * as solanaWeb3 from "@solana/web3.js";
+console.log(solanaWeb3);
+```
+
+```js
+//BrowserBundle
+// solanaWeb3 is provided in the global namespace by the bundle script
+console.log(solanaWeb3);
+```
